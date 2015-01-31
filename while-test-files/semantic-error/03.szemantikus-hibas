@@ -1,0 +1,6 @@
+program negate
+    integer i;
+    boolean b;
+begin
+    write(b - i);
+end
