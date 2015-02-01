@@ -2,7 +2,7 @@
 {-# LANGUAGE
   NoMonomorphismRestriction, LambdaCase, RecordWildCards,
   TupleSections, DeriveFunctor, DeriveFoldable, DeriveTraversable,
-  FlexibleContexts #-}
+  FlexibleContexts, OverloadedStrings #-}
 
 import Control.Applicative
 import Control.Comonad
@@ -11,15 +11,21 @@ import Control.Lens
 import Control.Monad.Except
 import Control.Monad.State.Strict
 import Control.Monad.Writer.Strict
+
 import Data.Bifoldable
 import Data.Bitraversable
 import Data.Foldable (Foldable)
-import Data.List
+import qualified Data.Traversable as T (mapM)
+
 import System.FilePath.Glob
 import System.Environment
 import Text.Printf
+
+import Data.List
 import qualified Data.HashMap.Strict as HM
-import qualified Data.Traversable as T (mapM)
+
+import Formatting (formatToString, (%))
+import Formatting.ShortFormatters
 
 import Text.Parsec hiding ((<|>), many, many1, label)
 import Text.Parsec.Combinator
@@ -27,6 +33,14 @@ import Text.Parsec.Expr
 import Text.Parsec.Pos
 import Text.Parsec.String (Parser)
 import qualified Text.Parsec.Token as Tok
+
+
+---- UTIL
+----------------------------------------------------------------------
+
+format       = formatToString
+(f .: g) x y = f (g x y)
+pos ma       = (:<) <$> getPosition <*> ma  
 
 
 ---- MAIN
@@ -58,7 +72,7 @@ testParser :: FilePath -> IO ()
 testParser path = do
   paths <- sort <$> glob path
   forM_ paths $ \path -> do
-    printf "\ntesting parsing on file: %s\n" path
+    putStrLn $ format ("\ntesting parsing on file: "%s%"\n") path
     inp <- readFile path
     either print (\_ -> putStrLn "OK") $ parse pProgram path inp
 
@@ -66,7 +80,7 @@ testChecker :: FilePath -> IO ()
 testChecker path = do
   paths <- sort <$> glob path
   forM_ paths $ \path -> do
-    printf "\ntesting type checking on file: %s\n" path
+    putStrLn $ format ("\ntesting type checking on file: "%s%"\n") path
     either putStrLn (\_ -> putStrLn "OK") =<< checkFile path
 
 checkFile :: FilePath -> IO (Either String ())
@@ -134,10 +148,12 @@ instance Bitraversable StF where
 
 ---- PARSER
 ----------------------------------------------------------------------
-    
+
+binOps, binFuns :: [String]    
 binOps  = ["+", "-", "*", "<", ">", "="]
 binFuns = ["and", "or", "not", "div", "mod"]
 
+reservedNames :: [String]
 reservedNames = [
   "program", "begin", "end", "integer",
   "boolean", "true", "false", "div",
@@ -158,9 +174,6 @@ Tok.TokenParser {..} =
     reservedNames   = reservedNames,
     reservedOpNames = binOps ++ binFuns,
     caseSensitive   = True }
-
-(f .: g) x y = f (g x y)
-pos ma = (:<) <$> getPosition <*> ma  
 
 mkBinOp :: Stream s m Char => BinOp -> String -> Operator s u m RawExp
 mkBinOp opType op = Infix go AssocLeft where
@@ -266,16 +279,16 @@ biRetagM combine tagEx init datSum datOp f = go where
 (=?) has want =
   unless (has == want) $ do
     pos <- use currPos
-    throwError $ printf
-      "%s: expected type %s, inferred %s"
+    throwError $ format 
+      (s%": expected type "%s%", inferred "%s)
       (show pos) (show want) (show has)
 
 lookupId :: Id -> Check Type
 lookupId id = 
   use (symTable . at id) >>= maybe
     (do pos <- use currPos
-        throwError $ printf
-          "%s: undefined variable: %s" (show pos) id)
+        throwError $ format
+          (s%": undefined variable: "%s) (show pos) id)
     (pure . snd)  
 
 inferExp :: RawExp -> Check Exp
@@ -306,8 +319,8 @@ checkDecls =
     use (symTable . at id) >>= maybe
       (symTable . at id ?= (pos, ty))
       (\(pos', _) -> 
-        throwError $
-          printf "%s: identifier \"%s\" already declared at line %d"
+        throwError $ format
+          (s%": identifier \""%s%"\" already declared at line "%d)
           (show pos) id (sourceLine pos'))
 
 checkProgram :: RawProgram -> Check Program 
@@ -330,8 +343,8 @@ genDecls :: [Decl] -> Codegen ()
 genDecls decls = do
   tell "section .bss\n"
   forM_ decls $ \(_ :< (Const (ty, id))) -> do
-    let resTy = case ty of TInt -> "d"; TBool -> "b"
-    tell $ printf "%s: res%s 1\n" id resTy
+    let resTy = case ty of TInt -> 'd'; TBool -> 'b'
+    tell $ format (s%": res"%c%" 1\n") id resTy
 
 externs :: [Id]
 externs = ["read_unsigned", "write_unsigned", "read_boolean", "write_boolean"]
@@ -343,9 +356,9 @@ header = do
 
 genExp :: Exp -> Codegen ()
 genExp (_ :< exp) = case exp of
-  I i    -> tell $ printf "mov eax, %d\n" i
-  B b    -> tell $ printf "mov eax, %d\n" (fromEnum b)
-  Var id -> tell $ printf "mov eax, [%s]\n" id
+  I i    -> tell $ format ("mov eax, "%d%"\n") i
+  B b    -> tell $ format ("mov eax, "%d%"\n") (fromEnum b)
+  Var id -> tell $ format ("mov eax, ["%s%"]\n") id
   BinOp op l r -> do    
     genExp r
     tell "push eax\n"
@@ -364,11 +377,11 @@ genExp (_ :< exp) = case exp of
         endLabel  <- newLabel
         tell "cmp eax, ebx\n"
         tell $ case other of
-          Greater -> printf "ja %s\n" trueLabel
-          Less    -> printf "jb %s\n" trueLabel
-          Equal   -> printf "je %s\n" trueLabel
+          Greater -> format ("ja "%s%"\n") trueLabel
+          Less    -> format ("jb "%s%"\n") trueLabel
+          Equal   -> format ("je "%s%"\n") trueLabel
         tell "xor eax, eax\n"
-        tell $ printf "jmp %s\n" endLabel
+        tell $ format ("jmp "%s%"\n") endLabel
         tell $ trueLabel ++ ":\n"
         tell "mov eax, 1\n"
         tell $ endLabel ++ ":\n"
@@ -380,13 +393,13 @@ genSt :: St -> Codegen ()
 genSt (_ :< st) = case st of
   Assign id exp -> do
     genExp exp
-    tell $ printf "mov [%s], eax\n" id
+    tell $ format ("mov ["%s%"], eax\n") id
   Read id -> do
     Just ty <- use $ symTable . at id
     case ty of
       TInt  -> tell "call read_unsigned\n"
       TBool -> tell "call read_boolean\n"
-    tell $ printf "mov [%s], eax\n" id
+    tell $ format ("mov ["%s%"], eax\n") id
   Write exp -> do
     genExp exp
     tell "push eax\n"
@@ -398,7 +411,7 @@ genSt (_ :< st) = case st of
     endLabel <- newLabel    
     genExp exp
     tell "cmp eax, 1\n"
-    tell $ printf "jne %s\n" endLabel
+    tell $ format ("jne "%s%"\n") endLabel
     each genSt sts
     tell $ endLabel ++ ":\n"
   IfElse exp ts fs -> do
@@ -406,9 +419,9 @@ genSt (_ :< st) = case st of
     endLabel  <- newLabel    
     genExp exp
     tell "cmp eax, 1\n"
-    tell $ printf "je %s\n" trueLabel
+    tell $ format ("je "%s%"\n") trueLabel
     each genSt fs
-    tell $ printf "jmp %s\n" endLabel
+    tell $ format ("jmp "%s%"\n") endLabel
     tell $ trueLabel ++ ":\n"
     each genSt ts
     tell $ endLabel ++ ":\n"
@@ -418,9 +431,9 @@ genSt (_ :< st) = case st of
     tell $ beginLabel ++ ":\n"
     genExp exp
     tell "cmp eax, 1\n"
-    tell $ printf "jne %s\n" endLabel
+    tell $ format ("jne "%s%"\n") endLabel
     each genSt sts
-    tell $ printf "jmp %s\n" beginLabel
+    tell $ format ("jmp "%s%"\n") beginLabel
     tell $ endLabel ++ ":\n"
   Skip ->
     pure ()
