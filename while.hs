@@ -19,7 +19,6 @@ import qualified Data.Traversable as T (mapM)
 
 import System.FilePath.Glob
 import System.Environment
-import Text.Printf
 
 import Data.List
 import qualified Data.HashMap.Strict as HM
