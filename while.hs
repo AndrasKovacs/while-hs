@@ -52,7 +52,7 @@ compile path inp = do
 ----------------------------------------------------------------------
 
 testDir :: FilePath
-testDir = "./while-tesztfajlok/"
+testDir = "./while-test-files/"
 
 testParser :: FilePath -> IO ()
 testParser path = do
