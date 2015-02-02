@@ -2,11 +2,12 @@
 {-# LANGUAGE
   NoMonomorphismRestriction, LambdaCase, RecordWildCards,
   TupleSections, DeriveFunctor, DeriveFoldable, DeriveTraversable,
-  FlexibleContexts, OverloadedStrings #-}
+  FlexibleContexts, OverloadedStrings, RecursiveDo #-}
 
+import Prelude hiding (div, mod, and, or, not)
 import Control.Applicative
-import Control.Comonad
-import Control.Comonad.Cofree
+import Control.Comonad 
+import Control.Comonad.Cofree (Cofree(..))
 import Control.Lens
 import Control.Monad.Except
 import Control.Monad.State.Strict
@@ -20,7 +21,9 @@ import qualified Data.Traversable as T (mapM)
 import System.FilePath.Glob
 import System.Environment
 
-import Data.List
+import Data.DList (DList)
+import qualified Data.DList as DL
+import Data.List (sort)
 import qualified Data.HashMap.Strict as HM
 
 import Formatting (formatToString, (%))
@@ -58,7 +61,8 @@ compile path inp = do
   ast <- parse pProgram path inp & _Left %~ show
   (ast, (_, symtable)) <- 
     runStateT (checkProgram ast) (initialPos path, HM.empty)
-  pure $ execWriter $ evalStateT (genProgram ast) (0, snd <$> symtable)    
+  let writerRes = execWriter $ evalStateT (genProgram ast) (0, snd <$> symtable)    
+  pure $ unlines $ DL.toList writerRes
 
 
 ---- TESTING
@@ -113,21 +117,21 @@ data BinOp
   | And | Or
   deriving (Eq, Show)
 
-data ExpF rec
+data ExpF k
   = I Integer
   | B Bool
   | Var Id
-  | BinOp BinOp rec rec
-  | Not rec
+  | BinOp BinOp k k
+  | Not k
   deriving (Eq, Show, Functor, Foldable, Traversable)
 
-data StF exp rec
+data StF exp k
   = Assign Id exp
   | Read Id
   | Write exp
-  | If exp [rec]
-  | IfElse exp [rec] [rec]
-  | While exp [rec]
+  | If exp [k]
+  | IfElse exp [k] [k]
+  | While exp [k]
   | Skip
   deriving (Eq, Show, Functor, Foldable, Traversable)
 
@@ -328,123 +332,146 @@ checkProgram (decls, sts) = do
   (decls,) <$> each inferSt sts
 
 
----- CODEGEN
+---- CODEGEN MACROS
 ----------------------------------------------------------------------
 
-type Codegen = StateT (Int, HM.HashMap Id Type) (Writer String)
+type Codegen = StateT (Int, HM.HashMap Id Type) (Writer (DList String))
 
-label = _1
+label :: String -> Codegen String
+label lbl = do
+  tell $ DL.singleton $ lbl ++ ":"
+  return lbl
 
 newLabel :: Codegen String
-newLabel = ("label"++) . show <$> (label <<+= 1)
+newLabel = do
+  i <- _1 <<+= 1
+  label $ "label" ++ show i
 
-genDecls :: [Decl] -> Codegen ()
-genDecls decls = do
-  tell "section .bss\n"
-  forM_ decls $ \(_ :< (Const (ty, id))) -> do
-    let resTy = case ty of TInt -> 'd'; TBool -> 'b'
-    tell $ format (s%": res"%c%" 1\n") id resTy
+newLine  = tell $ DL.singleton ""
+ret      = tell $ DL.singleton "ret"
+res ty n = tell $ DL.singleton $ "res" ++ ty ++ " " ++ show n
+resd     = res "d"
+resb     = res "b"
 
-externs :: [Id]
+binIns op a b = tell $ DL.singleton $ op ++ " " ++ a ++ ", " ++ b
+unaryIns op a = tell $ DL.singleton $ op ++ " " ++ a
+deref x       = "[" ++ x ++ "]"
+
+[mov, add, sub, or, and, cmp, xor] = map binIns
+  ["mov", "add", "sub", "or", "and", "cmp", "xor"]
+
+[call, ja, jb, je, jmp, jne, not, div,
+ mod, mul, push, pop, section, extern, global] = map unaryIns
+  ["call", "ja", "jb", "je", "jmp", "jne", "not", "div",
+   "mod", "mul", "push", "pop", "section", "global", "extern"]
+
+[eax, ebx, edx, bss, text] =
+  ["eax", "ebx", "edx", ".bss", ".text"]
+
 externs = ["read_unsigned", "write_unsigned", "read_boolean", "write_boolean"]
 
-header :: Codegen ()
-header = do
-  tell "global main\n"
-  mapM_ (\s -> tell $ "extern " ++ s ++ "\n") externs
+
+---- CODEGEN 
+----------------------------------------------------------------------
 
 genExp :: Exp -> Codegen ()
 genExp (_ :< exp) = case exp of
-  I i    -> tell $ format ("mov eax, "%d%"\n") i
-  B b    -> tell $ format ("mov eax, "%d%"\n") (fromEnum b)
-  Var id -> tell $ format ("mov eax, ["%s%"]\n") id
+  I i    -> mov eax (show i)
+  B b    -> mov eax (show $ fromEnum b)
+  Var id -> mov eax (deref id)
   BinOp op l r -> do    
     genExp r
-    tell "push eax\n"
+    push eax
     genExp l
-    tell "pop ebx\n"
+    pop ebx
     case op of
-      Add  -> tell "add eax, ebx\n"
-      Sub  -> tell "sub eax, ebx\n"
-      Mul  -> tell "mul ebx\n"
-      Div  -> tell "div ebx\n"
-      Mod  -> tell "mod ebx\n" >> tell "mov eax, edx\n"
-      And  -> tell "and eax, ebx\n"
-      Or   -> tell "or eax, ebx\n"
-      other -> do
-        trueLabel <- newLabel
-        endLabel  <- newLabel
-        tell "cmp eax, ebx\n"
-        tell $ case other of
-          Greater -> format ("ja "%s%"\n") trueLabel
-          Less    -> format ("jb "%s%"\n") trueLabel
-          Equal   -> format ("je "%s%"\n") trueLabel
-        tell "xor eax, eax\n"
-        tell $ format ("jmp "%s%"\n") endLabel
-        tell $ trueLabel ++ ":\n"
-        tell "mov eax, 1\n"
-        tell $ endLabel ++ ":\n"
+      Add  -> add eax ebx
+      Sub  -> sub eax ebx
+      Mul  -> mul ebx
+      Div  -> div ebx
+      Mod  -> do {mod ebx; mov eax edx}
+      And  -> and eax ebx
+      Or   -> or eax ebx
+      other -> mdo
+        cmp eax ebx
+        case other of
+          Greater -> ja true
+          Less    -> jb true
+          Equal   -> je true
+        mov eax "0"
+        jmp end
+        true <- newLabel
+        mov eax "1"
+        end <- newLabel
+        pure ()
   Not exp -> do
     genExp exp
-    tell "not eax\n"    
+    not eax
 
 genSt :: St -> Codegen ()
 genSt (_ :< st) = case st of
   Assign id exp -> do
     genExp exp
-    tell $ format ("mov ["%s%"], eax\n") id
+    mov (deref id) eax
   Read id -> do
     Just ty <- use $ symTable . at id
     case ty of
-      TInt  -> tell "call read_unsigned\n"
-      TBool -> tell "call read_boolean\n"
-    tell $ format ("mov ["%s%"], eax\n") id
+      TInt  -> call "read_unsigned"
+      TBool -> call "read_boolean"
+    mov (deref id) eax
   Write exp -> do
     genExp exp
-    tell "push eax\n"
+    push eax
     case snd $ extract exp of
-      TInt  -> tell "call write_unsigned\n"
-      TBool -> tell "call write_boolean\n"
-    tell "pop eax\n"
-  If exp sts -> do
-    endLabel <- newLabel    
+      TInt  -> call "write_unsigned"
+      TBool -> call "write_boolean"
+    pop eax
+  If exp sts -> mdo
     genExp exp
-    tell "cmp eax, 1\n"
-    tell $ format ("jne "%s%"\n") endLabel
+    cmp eax "1"
+    jne end
     each genSt sts
-    tell $ endLabel ++ ":\n"
-  IfElse exp ts fs -> do
-    trueLabel <- newLabel
-    endLabel  <- newLabel    
+    end <- newLabel
+    pure ()
+  IfElse exp ts fs -> mdo
     genExp exp
-    tell "cmp eax, 1\n"
-    tell $ format ("je "%s%"\n") trueLabel
+    cmp eax "1"
+    je true
     each genSt fs
-    tell $ format ("jmp "%s%"\n") endLabel
-    tell $ trueLabel ++ ":\n"
+    jmp end
+    true <- newLabel
     each genSt ts
-    tell $ endLabel ++ ":\n"
-  While exp sts -> do
-    beginLabel <- newLabel
-    endLabel   <- newLabel
-    tell $ beginLabel ++ ":\n"
+    end <- newLabel
+    pure ()
+  While exp sts -> mdo
+    begin <- newLabel
     genExp exp
-    tell "cmp eax, 1\n"
-    tell $ format ("jne "%s%"\n") endLabel
+    cmp eax "1"
+    jne end
     each genSt sts
-    tell $ format ("jmp "%s%"\n") beginLabel
-    tell $ endLabel ++ ":\n"
+    jmp begin
+    end <- newLabel
+    pure ()
   Skip ->
     pure ()
 
 genProgram :: Program -> Codegen ()
 genProgram (decls, sts) = do
-  tell "\n"
-  header
-  tell "\n"
-  genDecls decls
-  tell  "\n"
-  tell "section .text\n"
-  tell "main:\n"
+  newLine
+  global "main"
+  mapM_ extern externs
+  
+  newLine
+  section bss
+  forM_ decls $ \(_ :< (Const (ty, id))) -> do
+    label id
+    case ty of
+      TInt -> resd 1
+      TBool -> resb 1
+  
+  newLine
+  section text
+  label "main"
   each genSt sts
-  tell "ret\n"    
+  ret
+
